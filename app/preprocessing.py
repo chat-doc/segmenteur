@@ -24,12 +24,16 @@ FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
 
 # Shortcodes 11ty typiques.
+# NB : on utilise des backreferences (\1, \3) pour matcher le meme type de
+# quote au debut et a la fin de chaque chaine. Ca permet aux apostrophes
+# d'apparaitre a l'interieur d'une chaine double-quotee (cas frequent :
+# `{% image "capture.png", "Écran d'installation" %}`).
 IMAGE_SHORTCODE_RE = re.compile(
-    r"""\{%\s*image\s+["']([^"']+)["']\s*,\s*["']([^"']+)["'][^%]*%\}""",
+    r"""\{%\s*image\s+(["'])(.+?)\1\s*,\s*(["'])(.+?)\3[^%]*%\}""",
     re.IGNORECASE,
 )
 VIDEO_SHORTCODE_RE = re.compile(
-    r"""\{%\s*video\s+["']([^"']+)["']\s*,\s*["']([^"']+)["'][^%]*%\}""",
+    r"""\{%\s*video\s+(["'])(.+?)\1\s*,\s*(["'])(.+?)\3[^%]*%\}""",
     re.IGNORECASE,
 )
 
@@ -56,7 +60,12 @@ MOJIBAKE_MAP = {
     "Ã©": "é",
     "Ã¨": "è",
     "Ãª": "ê",
-    "Ã ": "à",
+    # NB : le motif "Ã " conserve son espace de queue. Le mojibake typique
+    # est "Ã\xa0" (Ã + NBSP) qu'on couvre juste apres. Ici on gere aussi
+    # le cas defensif "Ã " (avec regular space) pour que la substitution
+    # ne mange pas le blanc suivant.
+    "Ã ": "à ",
+    "Ã\xa0": "à",
     "Ã®": "î",
     "Ã´": "ô",
     "Ã§": "ç",
@@ -91,8 +100,9 @@ def preserve_image_alt(text: str) -> str:
     Le alt est souvent porteur d'information (nom d'un bouton, action, contexte).
     Le stripping brut des templates ferait perdre cette info.
     """
-    text = IMAGE_SHORTCODE_RE.sub(lambda m: f"[Image : {m.group(2).strip()}]", text)
-    text = VIDEO_SHORTCODE_RE.sub(lambda m: f"[Vidéo : {m.group(2).strip()}]", text)
+    # groupes : 1=quote_ouvrante_fichier, 2=fichier, 3=quote_ouvrante_alt, 4=alt
+    text = IMAGE_SHORTCODE_RE.sub(lambda m: f"[Image : {m.group(4).strip()}]", text)
+    text = VIDEO_SHORTCODE_RE.sub(lambda m: f"[Vidéo : {m.group(4).strip()}]", text)
     return text
 
 
@@ -144,19 +154,36 @@ def fix_mojibake(text: str) -> str:
 
     On ne touche que les textes qui présentent des marqueurs typiques
     (`Ã`, `â€`, `Å`) pour éviter de casser des textes déjà propres.
+
+    Stratégie :
+      1. Applique la table de remplacement ciblée d'abord (deterministe,
+         ne mange rien).
+      2. Si des marqueurs suspects persistent APRÈS remplacement (donc
+         mojibake plus obscur), tente un reencodage global latin1→utf8.
+
+    L'ordre est important : le reencodage global "consomme" les bytes
+    `Ã` isolés (fin d'une chaîne, suivis d'un caractère non-continuation)
+    et casse `"Ã "` → `" "` sans le fix par map. En appliquant la map en
+    premier, on gère les cas courants avant que iconv n'ait l'occasion
+    de les massacrer.
     """
     if not ("Ã" in text or "â€" in text or "Å" in text):
         return text
-    # Tentative de reencodage complet
-    try:
-        rebuilt = text.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
-        if rebuilt and rebuilt != text:
-            text = rebuilt
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        pass
-    # Remplacements ciblés (au cas où le reencodage n'a pas tout attrapé)
+
+    # 1. Table de remplacement ciblée d'abord.
     for old, new in MOJIBAKE_MAP.items():
         text = text.replace(old, new)
+
+    # 2. Reencodage global uniquement si les marqueurs suspects persistent
+    #    (ex: patrons de mojibake pas dans la map).
+    if "Ã" in text and any(f"Ã{c}" in text for c in "abcdefghijklmnopqrstuvwxyz"):
+        try:
+            rebuilt = text.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
+            if rebuilt and rebuilt != text:
+                text = rebuilt
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+
     return text
 
 
