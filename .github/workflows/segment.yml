@@ -1,0 +1,208 @@
+# .github/workflows/segment.yml - workflow declenchable via API GitHub par
+# Chat-Doc-Collection-Albert (PHP) pour segmenter un depot Markdown (site 11ty,
+# mkdocs, docs GitBook, etc.) et produire les segments prets a etre ingeres
+# dans une collection Albert.
+#
+# Aucune cle Albert dans ce workflow : le service est un pur transformateur
+# {code + docs} -> segments.jsonl. La cle Albert reste cote PHP.
+#
+# Le PHP declenche le workflow :
+#   POST /repos/{owner}/{repo}/actions/workflows/segment.yml/dispatches
+#   { "ref": "main", "inputs": {
+#       "target_repo_url": "https://forge.apps.education.fr/...",
+#       "target_ref": "main",
+#       "content_dir": "content",
+#       "site_base_url": "https://...",
+#       "correlation_id": "<uuid genere par PHP>"
+#   }}
+#
+# L'API workflow_dispatch ne retourne pas le run_id : le PHP le retrouve via
+# `run-name` qui contient le correlation_id.
+#
+# Puis recupere l'artefact segments.jsonl et upload lui-meme vers Albert.
+
+name: Segmenter Markdown
+
+run-name: segmenter ${{ inputs.correlation_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo_url:
+        description: 'URL HTTPS du depot Markdown a segmenter'
+        required: true
+      target_ref:
+        description: 'Branche / tag / SHA (defaut : main, avec fallback master)'
+        required: false
+        default: 'main'
+      content_dir:
+        description: 'Sous-dossier des .md (auto-detecte : content -> src -> racine)'
+        required: false
+        default: ''
+      site_base_url:
+        description: 'URL publique du site (pour construire source_url avec ancre)'
+        required: false
+        default: ''
+      target_chars:
+        description: 'Taille cible d''un segment en caracteres'
+        required: false
+        default: '1600'
+      overlap:
+        description: 'Chevauchement entre segments'
+        required: false
+        default: '200'
+      correlation_id:
+        description: 'UUID injecte par le PHP pour retrouver ce run'
+        required: true
+
+# Annule un run precedent en cours pour le meme depot si un nouvel appel arrive.
+concurrency:
+  group: segment-${{ inputs.target_repo_url }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # 1. Validation basique des inputs.
+  # ---------------------------------------------------------------------------
+  validate-input:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate URL
+        env:
+          TARGET_REPO_URL: ${{ inputs.target_repo_url }}
+        run: |
+          if [ -z "$TARGET_REPO_URL" ]; then
+            echo "ERREUR: target_repo_url est obligatoire."
+            exit 1
+          fi
+          # Accepte forge.apps.education.fr, gitlab.com, github.com et Codeberg.
+          # Elargir cette liste si besoin.
+          if ! echo "$TARGET_REPO_URL" | grep -qE '^https://(forge\.apps\.education\.fr|gitlab\.com|github\.com|codeberg\.org)/'; then
+            echo "ERREUR: URL non supportee."
+            echo "Autorises : forge.apps.education.fr, gitlab.com, github.com, codeberg.org"
+            exit 1
+          fi
+          echo "Cible : $TARGET_REPO_URL (${{ inputs.target_ref }})"
+
+  # ---------------------------------------------------------------------------
+  # 2. Clone shallow du depot cible, upload en artefact partage.
+  # ---------------------------------------------------------------------------
+  prepare:
+    needs: validate-input
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone target
+        env:
+          TARGET_REPO_URL: ${{ inputs.target_repo_url }}
+          TARGET_REF: ${{ inputs.target_ref }}
+        run: |
+          mkdir -p src
+          # Quand target_ref vaut le defaut 'main', on resout le vrai default
+          # branch du remote. Beaucoup de depots utilisent 'master' (typique
+          # sur forge.apps.education.fr : e-cole/e-ventail, etc.). Sans ca,
+          # `clone --branch main` echoue.
+          if [ "$TARGET_REF" = "main" ] || [ -z "$TARGET_REF" ]; then
+            DETECTED=$(git ls-remote --symref "$TARGET_REPO_URL" HEAD 2>/dev/null \
+              | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}')
+            if [ -n "$DETECTED" ]; then
+              echo "Default branch detecte : $DETECTED (override de '$TARGET_REF')"
+              TARGET_REF="$DETECTED"
+            fi
+          fi
+          # core.protectNTFS/HFS bloquent le checkout de fichiers avec *, ?, :,
+          # etc. (CVE-2022-39253). Cas reel : ferronier/ferronier a
+          # `themes/.../content/description/{*.id}.description`. Comme on lit
+          # en read-only sans jamais commiter, on peut les desactiver.
+          git -c core.protectNTFS=false -c core.protectHFS=false \
+              clone --depth=1 --branch "$TARGET_REF" "$TARGET_REPO_URL" src/target
+          du -sh src/target
+
+      - name: Strip paths invalid for upload-artifact
+        # actions/upload-artifact@v4 refuse tout chemin contenant " : < > | * ? \r \n
+        # (compatibilite NTFS). Sans ce menage, l'upload echoue et le job segment
+        # aval plante au download.
+        run: |
+          cd src/target
+          INVALID=$(find . -type f -regextype posix-extended -regex '.*[*?":<>|].*' 2>/dev/null || true)
+          if [ -n "$INVALID" ]; then
+            COUNT=$(echo "$INVALID" | wc -l)
+            echo "Fichiers avec caracteres interdits ($COUNT) :"
+            echo "$INVALID"
+            echo "$INVALID" | while IFS= read -r f; do rm -f "$f" 2>/dev/null || true; done
+          else
+            echo "Aucun fichier avec caracteres interdits."
+          fi
+
+      - name: Upload target
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-src
+          path: src/target/
+          retention-days: 1
+          include-hidden-files: true
+          # ECHEC explicite si rien n'a ete uploade : evite que prepare reussisse
+          # silencieusement et que segment plante au download.
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. Segmentation : download target-src + code du segmenteur + run cli.
+  # ---------------------------------------------------------------------------
+  segment:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout segmenteur code
+        uses: actions/checkout@v4
+
+      - name: Download target
+        uses: actions/download-artifact@v4
+        with:
+          name: target-src
+          path: src/target
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install
+        run: |
+          pip install --quiet -r requirements.txt
+
+      - name: Segmenter
+        continue-on-error: true
+        env:
+          CONTENT_DIR: ${{ inputs.content_dir }}
+          SITE_BASE_URL: ${{ inputs.site_base_url }}
+          TARGET_CHARS: ${{ inputs.target_chars }}
+          OVERLAP: ${{ inputs.overlap }}
+        run: |
+          # Filet : artefacts vides AVANT toute logique. Si le CLI plante,
+          # on garde des fichiers valides pour le download PHP.
+          echo -n > segments.jsonl
+          echo '{"stats":{"files_scanned":0,"documents_created":0,"segments_total":0,"documents_excluded":0,"errors":1},"excluded":[]}' > report.json
+          python -m app.cli \
+            --source-dir src/target \
+            --content-dir "$CONTENT_DIR" \
+            --site-base-url "$SITE_BASE_URL" \
+            --target-chars "$TARGET_CHARS" \
+            --overlap "$OVERLAP" \
+            --output segments.jsonl \
+            --report report.json
+          echo "---"
+          echo "Segments (lignes JSONL) : $(wc -l < segments.jsonl)"
+          echo "Taille segments.jsonl : $(du -h segments.jsonl | cut -f1)"
+          echo "Taille report.json : $(du -h report.json | cut -f1)"
+
+      - name: Upload segments
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: segments
+          path: |
+            segments.jsonl
+            report.json
+          retention-days: 7
+          if-no-files-found: error
